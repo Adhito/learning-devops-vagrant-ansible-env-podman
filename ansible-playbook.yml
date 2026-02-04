@@ -1,0 +1,229 @@
+---
+- name: Stage - Install Podman and Prerequisites
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Podman and required system packages
+      apt:
+        pkg:
+          - podman
+          - dbus-user-session
+          - uidmap
+          - slirp4netns
+          - fuse-overlayfs
+        state: present
+
+
+- name: Stage - Configure Rootless Podman for Vagrant User
+  hosts: all
+  become: true
+  tasks:
+    - name: Enable lingering for vagrant user
+      command: loginctl enable-linger vagrant
+      args:
+        creates: /var/lib/systemd/linger/vagrant
+
+    - name: Ensure vagrant user has subuid entry
+      lineinfile:
+        path: /etc/subuid
+        line: "vagrant:100000:65536"
+        create: yes
+
+    - name: Ensure vagrant user has subgid entry
+      lineinfile:
+        path: /etc/subgid
+        line: "vagrant:100000:65536"
+        create: yes
+
+    - name: Verify vagrant user subuid configuration
+      command: cat /etc/subuid
+      register: subuid_check
+      changed_when: false
+
+    - name: Display subuid configuration
+      debug:
+        var: subuid_check.stdout_lines
+
+
+- name: Stage - Enable Podman REST API Socket
+  hosts: all
+  become: true
+  become_user: vagrant
+  vars:
+    ansible_become_flags: "-i"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/1000"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus"
+  tasks:
+    - name: Ensure XDG_RUNTIME_DIR exists
+      file:
+        path: /run/user/1000
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0700'
+      become: true
+      become_user: root
+
+    - name: Enable podman socket for vagrant user
+      systemd:
+        name: podman.socket
+        enabled: yes
+        state: started
+        scope: user
+
+
+- name: Stage - Enable Podman REST API over TCP
+  hosts: all
+  become: true
+  become_user: vagrant
+  vars:
+    ansible_become_flags: "-i"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/1000"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus"
+  tasks:
+    - name: Create systemd user directory
+      file:
+        path: /home/vagrant/.config/systemd/user
+        state: directory
+        owner: vagrant
+        group: vagrant
+        mode: '0755'
+
+    - name: Create Podman TCP service file
+      copy:
+        dest: /home/vagrant/.config/systemd/user/podman-tcp.service
+        owner: vagrant
+        group: vagrant
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Podman API Service (TCP)
+          After=podman.socket
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/podman system service tcp:0.0.0.0:8888 --time=0
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=default.target
+
+    - name: Reload systemd user daemon
+      systemd:
+        daemon_reload: yes
+        scope: user
+
+    - name: Enable and start Podman TCP service
+      systemd:
+        name: podman-tcp.service
+        enabled: yes
+        state: started
+        scope: user
+
+
+- name: Stage - Test Podman with Hello-World Container
+  hosts: all
+  become: true
+  become_user: vagrant
+  vars:
+    ansible_become_flags: "-i"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/1000"
+  tasks:
+    - name: Verify podman is installed
+      command: podman --version
+      register: podman_version
+      changed_when: false
+
+    - name: Display podman version
+      debug:
+        var: podman_version.stdout
+
+    - name: Pull hello-world image
+      containers.podman.podman_image:
+        name: docker.io/library/hello-world
+        state: present
+
+    - name: Run hello-world container
+      containers.podman.podman_container:
+        name: hello-world-container
+        image: docker.io/library/hello-world
+        state: started
+        detach: false
+      register: hello_world_result
+
+    - name: Display hello-world result
+      debug:
+        var: hello_world_result
+
+
+- name: Stage - Verify Podman REST API
+  hosts: all
+  become: true
+  become_user: vagrant
+  vars:
+    ansible_become_flags: "-i"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/1000"
+  tasks:
+    - name: Wait for Podman socket to be ready
+      wait_for:
+        path: /run/user/1000/podman/podman.sock
+        state: present
+        timeout: 30
+
+    - name: Test Podman REST API via socket
+      uri:
+        url: "http://localhost/v4.0.0/libpod/info"
+        unix_socket: "/run/user/1000/podman/podman.sock"
+        method: GET
+        return_content: yes
+      register: socket_api_response
+
+    - name: Display Socket API response
+      debug:
+        msg: "Podman REST API (Socket) is accessible. Version: {{ socket_api_response.json.version.Version }}"
+
+    - name: Wait for TCP service to be ready
+      wait_for:
+        port: 8888
+        host: localhost
+        state: started
+        timeout: 30
+
+    - name: Test Podman REST API via TCP
+      uri:
+        url: "http://localhost:8888/v4.0.0/libpod/info"
+        method: GET
+        return_content: yes
+      register: tcp_api_response
+
+    - name: Display TCP API response
+      debug:
+        msg: "Podman REST API (TCP) is accessible on port 8888. Version: {{ tcp_api_response.json.version.Version }}"
+
+    - name: Display final success message
+      debug:
+        msg: |
+          ============================================
+          Podman Installation Complete!
+          ============================================
+          Podman Version: {{ podman_version.stdout }}
+
+          REST API Access:
+          - Socket: /run/user/1000/podman/podman.sock
+          - TCP: http://192.168.1.10:8888
+
+          Test commands:
+          - podman run hello-world
+          - curl http://localhost:8888/v4.0.0/libpod/info
+          ============================================
