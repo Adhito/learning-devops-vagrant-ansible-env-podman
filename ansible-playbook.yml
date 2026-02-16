@@ -16,7 +16,56 @@
           - uidmap
           - slirp4netns
           - fuse-overlayfs
+          - python3-pip
         state: present
+
+
+- name: Stage - Create Administrator User with Password Authentication
+  hosts: all
+  become: true
+  tasks:
+    - name: Install passlib for password hashing
+      pip:
+        name: passlib
+        state: present
+
+    - name: Create administrator-01 user with password
+      ansible.builtin.user:
+        name: administrator-01
+        password: "{{ 'S4a*K!uLt&&Wof' | password_hash('sha512') }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        create_home: yes
+        state: present
+
+    - name: Remove cloud-init SSH config that disables password auth
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+        state: absent
+      notify: restart sshd
+
+    - name: Enable password authentication in SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+        state: present
+      notify: restart sshd
+
+    - name: Ensure PubkeyAuthentication is enabled (keep key-based auth)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PubkeyAuthentication'
+        line: 'PubkeyAuthentication yes'
+        state: present
+      notify: restart sshd
+
+  handlers:
+    - name: restart sshd
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
 
 
 - name: Stage - Configure Rootless Podman for Vagrant User
@@ -28,6 +77,11 @@
       args:
         creates: /var/lib/systemd/linger/vagrant
 
+    - name: Enable lingering for administrator-01 user
+      command: loginctl enable-linger administrator-01
+      args:
+        creates: /var/lib/systemd/linger/administrator-01
+
     - name: Ensure vagrant user has subuid entry
       lineinfile:
         path: /etc/subuid
@@ -38,6 +92,18 @@
       lineinfile:
         path: /etc/subgid
         line: "vagrant:100000:65536"
+        create: yes
+
+    - name: Ensure administrator-01 user has subuid entry
+      lineinfile:
+        path: /etc/subuid
+        line: "administrator-01:200000:65536"
+        create: yes
+
+    - name: Ensure administrator-01 user has subgid entry
+      lineinfile:
+        path: /etc/subgid
+        line: "administrator-01:200000:65536"
         create: yes
 
     - name: Verify vagrant user subuid configuration
