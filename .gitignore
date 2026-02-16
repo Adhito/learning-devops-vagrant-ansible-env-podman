@@ -1,6 +1,9 @@
 # General
 .vagrant/
 
+# Claude Code
+.claude/
+
 # Log files (if you are creating logs in debug mode, uncomment this)
 *.log
 
